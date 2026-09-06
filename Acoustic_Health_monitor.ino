@@ -2,23 +2,26 @@
 #include <WiFi.h>
 #include <driver/i2s.h>
 #include <arduinoFFT.h>
-#include <driver/i2s.h>
-#include <arduinoFFT.h>
 #include <WebSocketsServer.h>
 #include <ArduinoJson.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 // =================================================================
 // 1. CONFIGURATION & CREDENTIALS
 // =================================================================
-// Replace with your personal Wi-Fi / Hotspot details
 const char* ssid     = "PRAVEEN";
 const char* password = "123456789";
-// --- M2: I2S HARDWARE PINS (INMP441) ---
+
+// --- TELEGRAM BOT CREDENTIALS ---
+const char* botToken = "8644007929:AAGxO3fRrY-qt9SgF9rLZxC6tcpiKAiLIO0"; 
+const char* chatId   = "-5334692827";
+// --- I2S HARDWARE PINS (INMP441) ---
 #define I2S_WS   25   // Word Select / L/R Clock (D25)
 #define I2S_SD   32   // Serial Data (D32)
 #define I2S_SCK  33   // Serial Clock (D33)
 #define I2S_PORT I2S_NUM_0
 
-// --- M3: FFT CONFIGURATION ---
+// --- FFT CONFIGURATION ---
 #define SAMPLES 512              // Power of 2
 #define SAMPLING_FREQ 16000.0    // 16 kHz sampling rate
 
@@ -33,14 +36,17 @@ double vImag[SAMPLES];
 ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, SAMPLES, SAMPLING_FREQ);
 WebSocketsServer webSocket(8080);//addedns
 
-// --- M6: DYNAMIC CALIBRATION & ANOMALY VARIABLES ---
+// --- DYNAMIC CALIBRATION & ANOMALY VARIABLES ---
 float ambientNoiseBaseline = 0.0;
 float dynamicFrictionThreshold = 100.0;
 bool isSystemCalibrated = false;
 int anomalyConsecutiveCount = 0;
 
+// --- TELEGRAM ALERT STATE ---
+bool alertAlreadySent = false;  // prevents repeated spam during one ongoing anomaly
+
 // =================================================================
-// 2. M2: HARDWARE AUDIO INGESTION (I2S)
+// 2. HARDWARE AUDIO INGESTION (I2S)
 // =================================================================
 void setupI2S() {
   i2s_config_t i2s_config = {
@@ -75,13 +81,13 @@ void captureLiveAudioSamples() {
     i2s_read(I2S_PORT, &raw_sample, sizeof(raw_sample), &bytes_read, portMAX_DELAY);
 
     // Scale 32-bit sample down into real array
-    vReal[i] = (double)(raw_sample >> 14);
+    vReal[i] = (double)(raw_sample >> 18);
     vImag[i] = 0.0;
   }
 }
 
 // =================================================================
-// 3. M3: SIGNAL PROCESSING & FFT MATH
+// 3. SIGNAL PROCESSING & FFT MATH
 // =================================================================
 void computeFFT() {
   FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
@@ -94,7 +100,7 @@ double getFrictionBandEnergy() {
   int numberOfBins = 0;
 
   for (int i = FRICTION_BIN_START; i <= FRICTION_BIN_END; i++) {
-    totalEnergy += (vReal[i] * vReal[i]);
+    totalEnergy += vReal[i];
     numberOfBins++;
   }
 
@@ -103,13 +109,12 @@ double getFrictionBandEnergy() {
   }
   return 0.0;
 }
-
 // =================================================================
-// 4. M6: DYNAMIC NOISE CALIBRATION & ANOMALY DECISION
+// 4. DYNAMIC NOISE CALIBRATION & ANOMALY DECISION
 // =================================================================
 void runAmbientNoiseCalibration() {
   Serial.println("\n==================================================");
-  Serial.println("[M6: CALIBRATION STARTED] Sampling ambient room noise...");
+  Serial.println("Sampling ambient room noise...");
   Serial.println(">> Ensure the test motor is OFF during these 3 seconds.");
   Serial.println("==================================================");
 
@@ -150,7 +155,30 @@ void runAmbientNoiseCalibration() {
 bool evaluateMachineHealth(float liveFrictionEnergy) {
   return (liveFrictionEnergy > dynamicFrictionThreshold);
 }
-// ===== FRONTEND INTEGRATION: send sensor data to script.js =====
+
+// =================================================================
+//  TELEGRAM ALERT FUNCTION
+// =================================================================
+void sendTelegramAlert(String message) {
+  WiFiClientSecure client;
+  client.setInsecure();  // skips certificate validation - acceptable for demo project
+
+  HTTPClient https;
+  message.replace(" ","%20");
+  String url = "https://api.telegram.org/bot" + String(botToken) +
+               "/sendMessage?chat_id=" + String(chatId) +
+               "&text=" + message;
+
+  if (https.begin(client, url)) {
+    int httpCode = https.GET();
+    Serial.print("Alert sent, HTTP code: ");
+    Serial.println(httpCode);
+    https.end();
+  } else {
+    Serial.println("Unable to connect to Telegram API");
+  }
+}
+// ===== FRONTEND INTEGRATION =====
 void sendTelemetry(double dominantFreq, float frictionEnergy, bool criticalAnomaly) {
   float anomalyScore = 0.0;
 
@@ -167,7 +195,7 @@ void sendTelemetry(double dominantFreq, float frictionEnergy, bool criticalAnoma
     status = "WARNING";
   }
 
-  StaticJsonDocument<12000> telemetry;
+  DynamicJsonDocument telemetry(8192);
   telemetry["peakFreq"] = dominantFreq;
   telemetry["anomalyScore"] = anomalyScore;
   telemetry["status"] = status;
@@ -184,8 +212,6 @@ void sendTelemetry(double dominantFreq, float frictionEnergy, bool criticalAnoma
   serializeJson(telemetry, payload);
   webSocket.broadcastTXT(payload);
 }
-// ===== END FRONTEND INTEGRATION =====
-// ===== FRONTEND INTEGRATION: receive webpage commands =====
 void handleWebSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length) {
   if (type != WStype_TEXT) {
     return;
@@ -201,7 +227,6 @@ void handleWebSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_
     runAmbientNoiseCalibration();
   }
 }
-// ===== END FRONTEND INTEGRATION =====
 // =================================================================
 // 5. SETUP & MAIN EXECUTION
 // =================================================================
@@ -234,20 +259,13 @@ void setup() {
 
   // 3. Run Initial Calibration
   runAmbientNoiseCalibration();
-  // ===== FRONTEND INTEGRATION: start WebSocket server =====
   webSocket.begin();
   webSocket.onEvent(handleWebSocketEvent);
-  // ===== END FRONTEND INTEGRATION =====
-
-
   Serial.println("Ready. Type 'c' in Serial Monitor anytime to re-calibrate.\n");
 }
 
 void loop() {
-  // Manual trigger to re-calibrate if the setup moves to a new room
-  // ===== FRONTEND INTEGRATION: keep WebSocket active =====
   webSocket.loop();
-  // ===== END FRONTEND INTEGRATION =====
   if (Serial.available() > 0) {
     char ch = Serial.read();
     if (ch == 'c' || ch == 'C') {
@@ -265,7 +283,7 @@ void loop() {
   double dominantFreq = FFT.majorPeak();
   float frictionEnergy = getFrictionBandEnergy();
 
-  // 4. M6 Anomaly Decision
+  // 4. Anomaly Decision
   bool singleFrameAnomaly = evaluateMachineHealth(frictionEnergy);
 
   if (singleFrameAnomaly) {
@@ -286,11 +304,15 @@ void loop() {
 
   if (criticalAnomaly) {
     Serial.println(" >>> [CRITICAL ANOMALY DETECTED!] <<<");
+    // --- SEND TELEGRAM ALERT (once per anomaly event) ---
+    if (!alertAlreadySent) {
+      sendTelegramAlert("URGENT: CRITICAL ANOMALY DETECTED - Machine friction spike.");
+      alertAlreadySent = true;
+    }
   } else {
     Serial.println(" | [STATUS: HEALTHY]");
+    alertAlreadySent = false;  // reset so next anomaly can trigger a fresh alert
   }
-// ===== FRONTEND INTEGRATION: send current FFT result =====
   sendTelemetry(dominantFreq, frictionEnergy, criticalAnomaly);
-  // ===== END FRONTEND INTEGRATION =====
   delay(100);
 }
